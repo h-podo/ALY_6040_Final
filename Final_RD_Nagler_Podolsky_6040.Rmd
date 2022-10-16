@@ -1,0 +1,305 @@
+---
+title: "Final_RD_Nagler_Podolsky_6040"
+author: "Harry Podolsky"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#Loading libraries
+library(pacman)
+p_load(ggpubr,scales,lubridate,rpart,caret,rpart.plot,
+       readxl,tidyverse,DataExplorer,moonBook,pROC,
+       kableExtra,e1071,ROSE)
+```
+
+## Introduction
+
+|           This dataset contains records of ecommerce transactions for several shelf stable food products. The data has been anonymized to protect customers. The raw data contains 18660 observations and 31 total variables. The variables include a mix of descriptive, categorical, and logical data types. They include unique identifiers for each customer,order, and product, a designation for whether an order was placed by a monthly subscriber or a one-time customer, billing city and region, date of order, total sales income, cancellation reason, and more. Before exploring this data, we undertook some basic cleaning steps including adjusting data types, exploring NA, and removing redundant variables.
+
+## Cleaning
+
+|           The result below displays the sum of NA or blank elements for each variable. The first few variables which describe orders directly have very few if any NA. We notice 16 NA values in billing region which will be explored, because billing city does not have NA and these variables should be paired - indicating a potential labeling error. The latter variables are describing aspects of subscriber behavior - whether a subscriber is active or cancelled, cancellation reason, cadence of subscription, when a subscription was created, and many more. As they are specific to subscribed customers, there are many many more blank records and NA values within these variables. One useful variable is the boolean subscriber_y/n. The data imports with YES for subscribers, and blanks for non-subscribers. It would be a mistake to confuse these blank data with NA, as will be the case for other variable types. We want to preserve a Y/N factorization for this variable so that we can explore subscriber vs. non-subscriber behavior. Initially this variable is entered as character data. We will begin data type optimization with it.
+
+```{r importing data,include=FALSE}
+#raw_data <- read_csv(file.choose())
+
+#Tom
+#setwd("~/Desktop/Roux Institute/Roux Institute Courses/ALY6040/Module 3")
+#raw_data <- read_csv("Updated_Dataset_Anonymized.csv")
+
+#Harry
+raw_data <- read_csv("/Users/harrypodolsky/Desktop/ALY 6040/6040_Data/Updated_Dataset_Anonymized.csv")
+
+colSums(is.na(raw_data) | raw_data == "") # sum of NA or blank records for each variable
+clean_data <- raw_data # copying raw data for cleaning 
+
+```
+```{r}
+#factorizing subscriber y/n
+clean_data$`subscriber_y/n` <- clean_data$`subscriber_y/n` |> 
+                                          replace_na("NO") |> 
+                                                 tolower() |> 
+                                                 as.factor()
+                                  
+prop.table(table(clean_data$`subscriber_y/n`)) #Roughly half of the users are subscribers
+```
+
+|           Next we converted date columns from character to timestamp datatype. In addition, an analysis of unique values in the <billing_city> and <billing_region> variables showed the need for some cleaning, specifically in changing state abbreviations (e.g. IN) to the full state name (e.g. Indiana). Shopify reporting typically converts addresses to a normal format, so the instances of this discrepancy were few. 
+
+```{r,results='hide'}
+clean_data <- clean_data |>  mutate(day=mdy(day))
+clean_data <- clean_data |>  mutate(subscription_cancelled_date=mdy(subscription_cancelled_date))
+clean_data <- clean_data |>  mutate(subscription_created_date=mdy(subscription_created_date))
+clean_data <- clean_data |>  mutate(first_subscription_charge_date=mdy(clean_data$first_subscription_charge_date))
+                                    # ) Tom, could not get these other date objects to convert. Was wasting too much time on it so held off. if you can get them to                                     #  swap over awesome - this is a useful page for date parsing:     https://epirhandbook.com/en/working-with-dates.html#working-with-dates
+
+#unique(clean_data$billing_region)
+clean_data$billing_region[clean_data$billing_region=='Ca']<-'California'
+clean_data$billing_region[clean_data$billing_region=='Az']<-'Arizona'
+unique(clean_data$billing_region)
+head(clean_data$billing_postal_code)
+                 
+```
+
+## Subsetting to Analyze Subscription Data
+
+|           As we are interested in understanding subscriber behavior, we create a subset of transactions coded as being a subscription. Of the 18,660 objects in the full dataset, 9,422 are attributed to subscribers. Note: subscriptions are inherently recurring, so subscribing customers will have multiple transactions, distinguished by unique order ids. 
+
+```{r subscribers - create subset of subscribers, include=TRUE}
+summary(clean_data$`subscriber_y/n`)
+subscriptions = filter(clean_data, `subscriber_y/n` == "yes")
+dim(subscriptions)
+```
+
+
+
+```{r subscribers - initial exploration, include=FALSE}
+unique(subscriptions$billing_city) # look through these for errors / dupes
+unique(subscriptions$billing_region)
+summary(subscriptions$billing_region)
+
+head(subscriptions$billing_postal_code)
+```
+
+|           For easier analysis by group, we factorized a number of categorical variables in the subscriptions subset. Changing the type of these variables helped with the visualizations shown below and will also be key when modeling.
+
+```{r subscribers - convert to factor, include=FALSE}
+attach(subscriptions)
+subscriptions$customer_id = as.factor(subscriptions$customer_id)
+subscriptions$purchase_option = as.factor(subscriptions$purchase_option)
+subscriptions$billing_city = as.factor(subscriptions$billing_city)
+subscriptions$billing_region = as.factor(subscriptions$billing_region)
+subscriptions$customer_type = as.factor(subscriptions$customer_type)
+subscriptions$variant_sku = as.factor(subscriptions$variant_sku)
+subscriptions$day_of_week = as.factor(subscriptions$day_of_week)
+subscriptions$product_title = as.factor(subscriptions$product_title)
+subscriptions$`subscriber_y/n` = as.factor(subscriptions$`subscriber_y/n`)
+subscriptions$`subscription status` = as.factor(subscriptions$`subscription status`)
+subscriptions$subscription_variant_title = as.factor(subscriptions$subscription_variant_title)
+subscriptions$order_interval_unit_and_frequency = as.factor(subscriptions$order_interval_unit_and_frequency)
+subscriptions$cancellation_reason = as.factor(subscriptions$cancellation_reason)
+```
+
+## Tables & Visualizations of Interest
+
+|           The below tables show the number of subscription sales occurring by day of the week. We learned from the client company that sales/promotions generally launch on Thursdays at 10 AM. One reason why transactions are not more concentrated on that day is because the subscription interval is not determined by transaction day of the week, but number of weeks following the fulfillment of the subscription. 
+
+```{r subscriptions - tables of descriptive statistics, echo=FALSE}
+summary(subscriptions$day_of_week)
+#summary(subscriptions$billing_region)
+```
+
+```{r subscriptions - top billing regions (plot below), include = FALSE}
+subscriptions |> 
+  group_by(billing_region) |>
+  summarize(regional_sales=round(sum(total_sales,na.rm = T),2),
+            mean_sales=round(mean(total_sales,na.rm = T),2),
+            transaction_sum=n()) |> 
+  arrange(-transaction_sum) %>% 
+  top_n(10)
+```
+
+|           The below tables shows that subscriptions are split almost evenly between the two wild blueberry juice SKUs. The product offering includes a 12 ct. and 3 ct. variant. The average unit price for a 12 ct. is 145.35 dollars including sales tax. Although the number of transactions for each SKU is relatively similar, the 12 ct. offering accounts for 79% of sales revenue.  
+
+```{r subscriptions - subscription by variant SKU, echo=FALSE}
+subscriptions |> 
+  group_by(variant_sku) |>
+  summarize(product_sales=round(sum(total_sales,na.rm = T),2),
+            average_price=round(mean(total_sales,na.rm = T),2),
+            transaction_count=n()) |> 
+  arrange(-product_sales) 
+```
+
+```{r subscriptions by status, include = FALSE}
+subscriptions |> 
+  group_by(`subscription status`) |>
+  summarize(product_sales=round(sum(total_sales,na.rm = T),2),
+            mean_product_sales=round(mean(total_sales,na.rm = T),2),
+            transaction_sum=n()) |> 
+  arrange(-product_sales) 
+```
+
+|           The subscription service offers three interval options at the time of purchase: two weeks, four weeks or six weeks. However, customers have the ability to customize their interval within subscription preferences. The below plot and table show the sales attributed to each interval classification since April 18, 2022, when the subscription service was launched. Obviously, the client prefers smaller intervals between subscriptions to increase recurrent sales. 
+
+```{r subscriptions - order interval plot, echo=FALSE,message=FALSE}
+order_interval_sales = subscriptions |> 
+  group_by(order_interval_unit_and_frequency) |>
+  summarize(product_sales=round(sum(total_sales,na.rm = T),2),
+            transaction_sum=n()) |> 
+  arrange(-product_sales) 
+
+
+
+
+sales_by_interval <-ggplot(order_interval_sales, aes(x= reorder(order_interval_unit_and_frequency, product_sales), y=product_sales)) +
+  geom_bar(stat="identity", fill="grey22") +
+  xlab("Subscription Interval") +
+  ylab("Gross Sales ($)") +
+  labs(title = "Bar Plot of Gross Subscription Sales by Interval since 4/18/22") +
+  coord_flip()
+sales_by_interval
+order_interval_sales %>% top_n(10)
+```
+|           Next we looked at the number of subscription-based transactions by billing region for the top ten largest regions in terms of sales revenue. The table below shows total sales, mean sales and transaction count for each region. Populations of each region are a driving factor for volume of transactions. Even so, it is an important insight for a company located (and shipping from) Maine to know that 1,847 subscription fulfillments have shipped to California since the service launched - well over twice as many as the next most active region. Subscriptions offer a discount to the customer of one-time purchase price and shipping is included; this incentive could lead to a detailed analysis of cost and revenue by geographical region. 
+
+```{r subscriptions - top states, echo=FALSE}
+top_states = subscriptions |> 
+  group_by(billing_region) |>
+  summarize(regional_sales=round(sum(total_sales,na.rm = T),2),
+            mean_sales=round(mean(total_sales,na.rm = T),2),
+            transaction_sum=n()) |> 
+  arrange(-transaction_sum) |>  
+  top_n(10)
+
+subscription_transactions_by_state = ggplot(top_states, aes(x= reorder(billing_region, transaction_sum), y=transaction_sum,fill=billing_region)) +
+  geom_bar(stat="identity") +
+  xlab("Billing State") +
+  ylab("Number of Subscription Transactions") +
+  labs(title = "Bar Plot of Subscription Transactions by Billing State") +
+  coord_flip()
+subscription_transactions_by_state
+top_states
+```
+|           The next plot shows subscription sales over time. Subscriptions have accounted for 903,134.80 dollars in sales since the service launch (4.18.22-10.7.22). Note a significant spike in sales in early-mid May. This was a promoted sale, and new subscriptions that resulted from it account for the sales spikes at the beginning of subsequent months, when these recurring transactions occur. This plot brings up an interesting business question: Can the team forecast sales using event modeling? If so, what model would be best for the limited amount of data available and for low periods of seasonality? 
+
+```{r subscriptions - sales over time, echo=FALSE}
+sales = subscriptions |> 
+  group_by(day) |>
+  summarize(total_sales=round(sum(total_sales,na.rm = T),2)) |> 
+  arrange(-total_sales) 
+
+sub_sales_plot = ggplot(sales, aes(x = day, y = total_sales)) + 
+  geom_line(color="blue") +
+  labs(y="Daily Subscription Sales ($)",x="Date",title = "Subscription Sales Over Time")
+sub_sales_plot
+#sum(subscriptions$total_sales)
+```
+
+|           We wrap up this initial exploratory work with an analysis of monthly sales in the top ten regional markets identified previously. This analysis is across all transactions, not just subscriber-originated observations. The graph below clearly demonstrates the large spike in sales in May driven by the site-wide promoted sale - and also the dominant impact of California on total sales. It is worth noting that the October numbers are lower because the data only goes through 10.7.2022, and April is similarly truncated due to the service launching in the latter half of that month. Overall sales have trended lower since the sale, but monthly numbers are fairly low resolution.
+```{r,include=FALSE}
+#creating an object with daily sales statistics
+total_regional_sales <- clean_data |> 
+  group_by(billing_region) |>
+  summarize(regional_sales=round(sum(total_sales,na.rm = T),2),
+            mean_sales=round(mean(total_sales,na.rm = T),2),
+            transaction_sum=n()) |> 
+  arrange(-transaction_sum)
+
+major_markets <- pull(total_regional_sales[1:10,1]) # vectorize top 10 markets for filtering the total_regional_sales object above
+
+#new object grouping the above sales figures by month
+top_regional_monthly_sales <- clean_data |> filter(billing_region %in% major_markets) |> 
+  group_by(billing_region,year=year(day),month=month(day)) |>
+  summarize(regional_sales=round(sum(total_sales,na.rm = T),2),
+            mean_sales=round(mean(total_sales,na.rm = T),2),
+            transaction_sum=n()) |> 
+            mutate(firstofmonth = ymd(paste0(year,'-' , month, '-1')))
+
+```
+
+```{r,message=FALSE,warning=FALSE}
+  top_regional_monthly_sales |>  
+  ggplot(aes(firstofmonth,regional_sales,fill=billing_region)) +
+      geom_bar(stat = 'identity')+
+      theme_bw()+
+      scale_y_continuous(labels=comma,breaks=c(100000,200000,300000,400000))+
+      scale_x_date(name="Month",date_breaks = "1 month", date_labels =  "%b") +
+      labs(y="Monthly Sales (USD)", title = "Sales Per Month", subtitle = "April - Oct 2022")
+```
+
+## Churn Analysis
+
+|           Any firm running a subscription service pays close attention to consumer churn. To better understand the motives of the 855 subscribers who have cancelled their service, we created a subset of the data by subscription_status. The plot below shows the relative frequency of cancellation reasons (for all transactions while the subscription was active through cancellation). Many cancellation requests flow through the company's customer service department (as opposed to through the customer portal),so "Other reason" accounts for around 47% of cancellations. 14% of cancellations cite that the service is cost-prohibitive, but this figure is likely under-reporting due to the high incidence of "Other reason" responses which may have actually been related to price. The client customer service team noted that many customers cite price as the leading factor for cancellations. This adds credence to the large opportunity presented by additional promoted discount events.
+
+```{r subscriptions - cancellation reason detail, echo=FALSE}
+summary(subscriptions$`subscription status`)
+cancelled = subscriptions %>% filter(subscriptions$`subscription status` == "CANCELLED")
+test = distinct(cancelled, customer_id, .keep_all = TRUE)
+
+cancel_reason_detail = test |> 
+  group_by(cancellation_reason) |>
+  summarize(count=n()) |> 
+  arrange(-count) %>% 
+  mutate(rel_freq = (count/sum(count)))
+
+number_of_customers_who_cancelled = n_distinct(cancelled$customer_id)
+number_of_customers_who_cancelled
+
+cancellation_reason_relative_freq <- ggplot(cancel_reason_detail, aes(x = reorder(cancellation_reason, rel_freq), y = rel_freq)) +
+  geom_bar(stat="identity", fill="darkgreen") +
+  labs(y="Relative Frequency",x="Reason for Cancelling Subscription",title = "Relative Frequency Plot Cancellation Reason") +
+  coord_flip()
+cancellation_reason_relative_freq
+cancel_reason_detail
+```
+
+
+
+```{r}
+#DataExplorer::create_report(subscriptions)
+
+```
+## Model 1 - Predicting Subscription with Decision Tree
+
+## Model 2 - Identifying Unique Transactions with Cluster Analysis
+
+## Model 3 - Naive Bayes
+
+## Conclusion
+
+|           The data tell a promising story for a nascent product line! Sales have been steady, the massive effect of the May sale event is a good indicator for future special offerings, and there is impressive subscriber uptake at about 50% of total transactions. The data is rich in categorical variables that we will explore further in modeling - location, cancellation reason, subscription order cadence, and many more. 
+
+## References
+
+  * Alboukadel Kassambara (2020). ggpubr: 'ggplot2' Based Publication Ready Plots. R package version 0.4.0. https://CRAN.R-project.org/package=ggpubr
+  
+  * Garrett Grolemund, Hadley Wickham (2011). Dates and Times Made Easy with lubridate. Journal of Statistical Software, 40(3), 1-25. URL         https://www.jstatsoft.org/v40/i03/.
+  
+  * R Core Team. (2016). R: A Language and Environment for Statistical Computing. Vienna, Austria. Retrieved from https://www.R-project.org/
+  
+  * Rinker, T. W. & Kurkiewicz, D. (2017). pacman: Package Management for R. version 0.5.0. Buffalo, New York. http://github.com/trinker/pacman
+  
+  * Hadley Wickham and Dana Seidel (2020). scales: Scale Functions for Visualization. R package version 1.1.1. https://CRAN.R-project.org/package=scales
+  
+  * Wickham et al., (2019). Welcome to the tidyverse. Journal of Open Source Software, 4(43), 1686, https://doi.org/10.21105/joss.01686
+  
+## Appendix
+
+```{r,echo=FALSE}
+#code for geom_point or geom_line of different numeric variables through time. Saving here for adoption later if we want it.
+
+  # top_regional_monthly_sales |> #filter(billing_region=="California") |> 
+  # ggplot(aes(firstofmonth,regional_sales)) +
+  #     geom_point()+
+  #     geom_smooth(method='lm',se=F)+
+  #     #geom_abline(intercept=euro_intercept, slope=euro_slope, color='red', name="European Trend Line") +
+  #     #ylim(9, 16)+
+  #     theme_bw()+
+  #     scale_y_continuous(labels=comma,breaks=c(25000,50000,75000,100000,125000,150000))+
+  #     scale_x_date(name="Month",date_breaks = "1 month", date_labels =  "%b") +
+  # #scale_x_discrete(breaks=c("4","5","6","7","8","9","10"))+
+  #     labs(y="Monthly Sales (USD)", title = "Sales Per Month", subtitle = "April - Oct 2022") +
+  #     facet_wrap(~billing_region)
+```
